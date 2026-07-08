@@ -1,0 +1,27 @@
+# Local credentials and captcha provider keys
+config.py
+sms.md
+
+# Runtime state and generated data
+date.csv
+.wos_state.json
+downloads/
+debug/
+tools/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
