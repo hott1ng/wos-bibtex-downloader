@@ -45,19 +45,19 @@ playwright install chromium
 Create `config.py` from `config.example.py`:
 
 ```python
-url = "http://www.90tsg.com"
-username = "your_username"
-password = "your_password"
+url = http://www.90tsg.com
+username = your_username
+password = your_password
 ```
 
 For multiple accounts:
 
 ```python
-url = "http://www.90tsg.com"
+url = http://www.90tsg.com
 
 accounts = [
-    {"username": "account_1", "password": "password_1", "label": "account-1"},
-    {"username": "account_2", "password": "password_2", "label": "account-2"},
+    {username: account_1, password: password_1, label: account-1},
+    {username: account_2, password: password_2, label: account-2},
 ]
 ```
 
@@ -113,6 +113,22 @@ Each successful batch updates `date.csv` immediately.
 - `wos_download.py`: integrated downloader.
 - `goto_loginpage.py`, `input_username.py`, `input_password.py`, `solve_numeric_captcha.py`, `click_login_button.py`: recorded login steps.
 - `click_english_database.py`, `click_wos_sci.py`, `select_wos_entry.py`, `search_publication_date.py`: recorded navigation/search helpers.
+
+## Cursor Skills
+
+This repository includes Cursor skills under `.cursor/skills/` for repeatable automation work:
+
+- `browser-flow-recorder`: records browser actions into reusable Python automation steps.
+- `wos-bibtex-downloader`: documents the Web of Science/SCI BibTeX download workflow.
+- `automation-stability-optimizer`: guides end-to-end stabilization loops for Playwright automation, including retries, popup cleanup, debug artifact capture, restart/resume behavior, and evidence-based reruns until one realistic flow succeeds or a real external blocker is found.
+
+Use the stability skill when changing fragile browser automation code or investigating failures:
+
+```text
+/automation-stability-optimizer
+```
+
+Debug artifacts are saved under `debug/` during local runs and are intentionally ignored by Git.
 
 ## Notes
 
