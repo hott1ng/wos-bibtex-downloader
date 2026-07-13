@@ -1,0 +1,34 @@
+date,account,run_count,successful_batches,downloaded_records,login_failures,account_limits,workflow_errors,last_result,last_message,updated_at
+2026-07-12,64840559,5,65,32500,0,5,0,account_limit,Export records 103801-104300 failed after 3 attempts; switching account.,2026-07-12 20:14:12
+2026-07-12,25995661346,14,0,0,7,3,4,account_limit,Export records 103801-103900 failed after 3 attempts; switching account.,2026-07-12 23:49:51
+2026-07-12,01715423419,6,0,0,5,1,0,account_limit,Export records 103801-103900 failed after 3 attempts; switching account.,2026-07-12 23:54:39
+2026-07-12,95753491516,6,0,0,5,0,1,workflow_error,No WOS entry is currently usable.,2026-07-12 23:58:41
+2026-07-12,21604411118,5,0,0,5,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:23:32
+2026-07-12,00892628187,5,0,0,5,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:25:53
+2026-07-12,49597930829,5,0,0,5,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:28:14
+2026-07-12,60684430740,5,0,0,5,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:30:36
+2026-07-12,53341882726,5,0,0,5,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:32:56
+2026-07-12,96992358165,5,0,0,4,0,1,workflow_error,Protocol error (Target.createTarget): Failed to open a new tab,2026-07-12 20:33:15
+2026-07-12,47085256509,4,0,0,3,0,1,login_failed,login failed after 4 attempts,2026-07-12 19:22:22
+2026-07-12,67941758059,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:24:41
+2026-07-12,16241021956,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:27:01
+2026-07-12,93470731994,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:29:21
+2026-07-12,07427530845,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:31:41
+2026-07-12,39624588727,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:34:00
+2026-07-12,93660436334,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:36:20
+2026-07-12,76800427131,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:38:39
+2026-07-12,85791799805,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:40:59
+2026-07-12,40384359132,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:43:19
+2026-07-12,61091715800,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:45:38
+2026-07-12,11618728310,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:47:58
+2026-07-12,08807934839,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:50:18
+2026-07-12,05235570360,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:52:38
+2026-07-12,56840518137,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:54:58
+2026-07-12,46388534816,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:57:18
+2026-07-12,51073104974,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 19:59:38
+2026-07-12,55402452902,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:01:57
+2026-07-12,16554528887,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:04:19
+2026-07-12,52166206960,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:06:38
+2026-07-12,23861051715,3,0,0,3,0,0,login_failed,login failed after 4 attempts,2026-07-12 20:08:58
+2026-07-13,25995661346,4,0,0,0,2,2,account_limit,Export records 104201-104300 failed after 3 attempts; switching account.,2026-07-13 10:23:35
+2026-07-13,01715423419,1,0,0,1,0,0,login_failed,login failed after 4 attempts,2026-07-13 10:23:57

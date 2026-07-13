@@ -7,7 +7,6 @@ The script follows the project skill in
 from __future__ import annotations
 
 import argparse
-import ast
 import csv
 import importlib.util
 import json
@@ -16,10 +15,10 @@ import re
 import struct
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import parse_qs, urlparse
 
 import ddddocr
 import requests
@@ -33,7 +32,6 @@ from playwright.sync_api import (
 )
 
 from bingtop_captcha import BingtopCaptchaError, extract_bingtop_credentials, solve_click_coordinates
-from twocaptcha_recaptcha import TwoCaptchaRecaptchaError, solve_hcaptcha, solve_recaptcha_v2
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -43,22 +41,19 @@ DATE_CSV_PATH = BASE_DIR / "date.csv"
 STATE_PATH = BASE_DIR / ".wos_state.json"
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DEBUG_DIR = BASE_DIR / "debug"
+ACCOUNT_DAILY_LOG_PATH = BASE_DIR / "account_daily_log.csv"
 
 ENGLISH_DATABASE_XPATH = "/html/body/div[4]/div[2]/div/ul/li[2]/a"
-WOS_SCI_XPATH = "/html/body/div[4]/div[3]/div/div/div[2]/a[6]"
 ADVANCED_SEARCH_XPATH = (
     "/html/body/app-wos/main/div/app-header/div[1]/header/div[2]/div[2]"
     "/div/nav/div[2]/div/div/a[2]/span[2]/span"
 )
 
 BINGTOP_ENTRY_CAPTCHA_TYPES = {
-    "wos2(定制)": 13152,
-    "wos2（定制）": 13152,
-    "wos2定制）": 13152,
-    "临时": 1309,
+    "Web of Science【njust推荐】": 13152,
 }
 ENTRY_NAMES = list(BINGTOP_ENTRY_CAPTCHA_TYPES)
-BATCH_SIZE = 500
+BATCH_SIZE = 100
 DEFAULT_TIMEOUT_MS = 30_000
 RETRY_DELAY_S = 2
 ACTION_DELAY_MS = 2_000
@@ -67,7 +62,7 @@ BROWSER_WINDOW_HEIGHT = 1_000
 CLICK_CAPTCHA_MAX_ATTEMPTS = 3
 CLICK_CAPTCHA_SUCCESS_WAIT_MS = 15_000
 RECAPTCHA_INITIAL_DOWNLOAD_WAIT_MS = 35_000
-RECAPTCHA_SOLVE_TIMEOUT_S = 180
+BINGTOP_RECAPTCHA_CAPTCHA_TYPE = 2303
 
 USERNAME_SELECTORS = [
     'input[name="username"]',
@@ -88,19 +83,24 @@ NUMERIC_CAPTCHA_INPUT_SELECTORS = [
     'input[name*="captcha" i]',
     'input[name*="verify" i]',
     'input[name*="code" i]',
+    'input[name*="key" i]',
     'input[id*="captcha" i]',
     'input[id*="verify" i]',
     'input[id*="code" i]',
+    'input[id*="key" i]',
     'input[placeholder*="验证码"]',
 ]
 NUMERIC_CAPTCHA_IMAGE_SELECTORS = [
     'img[src*="ShowKey" i]',
+    'img[src*="CheckCode" i]',
     'img[src*="captcha" i]',
     'img[src*="verify" i]',
     'img[src*="code" i]',
+    'img[src*="key" i]',
     'img[id*="captcha" i]',
     'img[id*="verify" i]',
     'img[id*="code" i]',
+    'img[id*="key" i]',
 ]
 CLICK_CAPTCHA_SELECTORS = [
     ".clicaptcha-img",
@@ -153,11 +153,21 @@ class AccountDownloadLimit(WorkflowError):
     """Raised when export retries suggest the current account is rate-limited."""
 
 
+class AccountUnavailable(WorkflowError):
+    """Raised when the current account cannot be used and the next one should be tried."""
+
+
+class ExportBatchSkipped(WorkflowError):
+    """Raised when the current export batch should be skipped and progress advanced."""
+
+
 def retry_step(label: str, attempts: int, func):
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         try:
             return func()
+        except ExportBatchSkipped:
+            raise
         except Exception as exc:
             last_error = exc
             logging.warning("%s failed on attempt %d/%d: %s", label, attempt, attempts, exc)
@@ -524,11 +534,6 @@ def read_sms_text(path: Path = SMS_PATH) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def extract_2captcha_key(sms_text: str) -> Optional[str]:
-    match = re.search(r"2captcha\.com\s*\n\s*API Key:\s*([A-Za-z0-9]+)", sms_text, re.I)
-    return match.group(1).strip() if match else None
-
-
 def load_state(path: Path = STATE_PATH) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -584,6 +589,73 @@ def write_date_tasks(tasks: Iterable[DateTask], path: Path = DATE_CSV_PATH) -> N
     tmp_path.replace(path)
 
 
+def update_account_daily_log(
+    account: str,
+    result: str,
+    batches: int,
+    records: int,
+    message: str = "",
+    path: Path = ACCOUNT_DAILY_LOG_PATH,
+    count_run: bool = True,
+) -> None:
+    fields = [
+        "date",
+        "account",
+        "run_count",
+        "successful_batches",
+        "downloaded_records",
+        "login_failures",
+        "account_limits",
+        "workflow_errors",
+        "last_result",
+        "last_message",
+        "updated_at",
+    ]
+    today = time.strftime("%Y-%m-%d")
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    rows: list[dict[str, str]] = []
+    if path.exists():
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+    target: Optional[dict[str, str]] = None
+    for row in rows:
+        if row.get("date") == today and row.get("account") == account:
+            target = row
+            break
+    if target is None:
+        target = {field: "0" for field in fields}
+        target["date"] = today
+        target["account"] = account
+        rows.append(target)
+
+    def add_int(field: str, amount: int) -> None:
+        current = int(target.get(field) or 0)
+        target[field] = str(current + max(amount, 0))
+
+    if count_run:
+        add_int("run_count", 1)
+    add_int("successful_batches", batches)
+    add_int("downloaded_records", records)
+    if result == "login_failed":
+        add_int("login_failures", 1)
+    elif result == "account_limit":
+        add_int("account_limits", 1)
+    elif result == "workflow_error":
+        add_int("workflow_errors", 1)
+
+    target["last_result"] = result
+    target["last_message"] = message[:300]
+    target["updated_at"] = now
+
+    tmp_path = path.with_suffix(".csv.tmp")
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    tmp_path.replace(path)
+
+
 def next_task(tasks: list[DateTask]) -> Optional[DateTask]:
     for task in tasks:
         if not task.is_finished:
@@ -629,6 +701,54 @@ def click_by_text(page: Page, texts: Iterable[str], label: str, timeout_ms: int 
         except PlaywrightTimeoutError as exc:
             last_error = exc
     raise WorkflowError(f"Cannot click {label}") from last_error
+
+
+def click_accept_all_if_present(page: Page, timeout_ms: int = 8_000) -> None:
+    selectors = [
+        "#onetrust-accept-btn-handler",
+        "[id*='onetrust'][id*='accept' i]",
+        "button:has-text('Accept all')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept all cookies')",
+        "button:has-text('Accept All Cookies')",
+        "text=/^Accept all$/i",
+        "text=/^Accept all cookies$/i",
+        "button[aria-label*='Accept all' i]",
+        "button[title*='Accept all' i]",
+    ]
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                if locator.count() and locator.is_visible(timeout=500):
+                    locator.click(timeout=2_000, force=True)
+                    logging.info("Clicked Accept All cookie button.")
+                    wait_after_action(page, "Accept All cookie button")
+                    return
+            except Exception:
+                continue
+        try:
+            clicked = page.evaluate(
+                """() => {
+                    const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                    const target = [...document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')]
+                      .find((el) => /^(Accept all|Accept all cookies)$/i.test(normalize(
+                        el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title')
+                      )));
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }"""
+            )
+            if clicked:
+                logging.info("Clicked Accept All cookie button by DOM fallback.")
+                wait_after_action(page, "Accept All cookie button")
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    logging.info("Accept All cookie button was not present; continuing.")
 
 
 def dismiss_wos_overlays(page: Page) -> None:
@@ -693,7 +813,108 @@ def is_logged_in(page: Page) -> bool:
         text = page.locator("body").inner_text(timeout=5_000)
     except PlaywrightTimeoutError:
         return False
-    return "亲爱的" in text and "退出" in text
+    if "亲爱的" in text and "退出" in text:
+        return True
+    zhixian_resource_page = "zhixianlib.com/e/action/ListInfo" in page.url
+    return zhixian_resource_page and "英文数据库" in text and "Web of Science【njust推荐】" in text
+
+
+def confirm_zhixian_login_by_resource_page(page: Page) -> bool:
+    if "zhixianlib.com" not in page.url:
+        return False
+    try:
+        page.goto(
+            "https://www.zhixianlib.com/e/action/ListInfo/?classid=63",
+            wait_until="domcontentloaded",
+            timeout=DEFAULT_TIMEOUT_MS,
+        )
+        text = page.locator("body").inner_text(timeout=5_000)
+        return "英文数据库" in text and "Web of Science【njust推荐】" in text
+    except Exception:
+        return False
+
+
+def is_member_login_page(page: Page) -> bool:
+    try:
+        text = page.locator("body").inner_text(timeout=5_000)
+    except PlaywrightTimeoutError:
+        return False
+    return "会员登录" in text and "用户名称" in text and "您的密码" in text
+
+
+def login_current_page(page: Page, config: Config, label: str = "current page login") -> None:
+    ocr = ddddocr.DdddOcr(show_ad=False)
+
+    def submit_member_login_form() -> None:
+        submitted = page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const normalize = (value) => (value || '').replace(/\\s+/g, '').trim();
+                const forms = [...document.querySelectorAll('form')];
+                const loginForm = forms.find((form) => {
+                    const text = form.innerText || form.textContent || '';
+                    return /用户名称|您的密码|验证码/.test(text) || form.querySelector('input[type="password"]');
+                });
+                if (!loginForm) return false;
+                const candidates = [...loginForm.querySelectorAll(
+                    'input[type="submit"], input[type="button"], input[type="image"], button, [role="button"]'
+                )].filter(visible);
+                const button = candidates.find((el) => /登录|Login|Sign in|立即登录/i.test(normalize(
+                    el.value || el.innerText || el.textContent || el.getAttribute('alt') || el.getAttribute('title')
+                ))) || candidates[candidates.length - 1];
+                if (button) {
+                    button.click();
+                    return true;
+                }
+                if (typeof loginForm.requestSubmit === 'function') {
+                    loginForm.requestSubmit();
+                    return true;
+                }
+                loginForm.submit();
+                return true;
+            }"""
+        )
+        if not submitted:
+            raise WorkflowError(f"Cannot submit {label} form")
+        wait_after_action(page, f"{label} form submit")
+
+    def attempt_login() -> None:
+        if not is_member_login_page(page):
+            return
+        first_visible(page, USERNAME_SELECTORS).fill(config.username)
+        wait_after_action(page, f"{label} username fill")
+        first_visible(page, PASSWORD_SELECTORS).fill(config.password)
+        wait_after_action(page, f"{label} password fill")
+        solve_numeric_captcha(page, ocr)
+        try:
+            submit = page.locator(
+                "form input[type='submit'][value*='登录'], form input[type='button'][value*='登录'], "
+                "form button[type='submit']:has-text('登录'), input[type='submit'][value*='登录'], "
+                "input[type='button'][value*='登录'], button[type='submit']:has-text('登录')"
+            ).first
+            submit.click(timeout=8_000)
+            wait_after_action(page, f"{label} submit button")
+        except Exception:
+            try:
+                submit_member_login_form()
+            except WorkflowError:
+                click_by_text(page, ["立即登录", "Login", "Sign in"], f"{label} button", timeout_ms=8_000)
+
+        page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+        for _ in range(8):
+            if not is_member_login_page(page):
+                return
+            page.wait_for_timeout(1_000)
+        captcha = page.locator('img[src*="ShowKey" i], img[src*="CheckCode" i], img[src*="captcha" i]').first
+        if captcha.count():
+            captcha.click()
+            wait_after_action(page, f"{label} numeric captcha refresh")
+        raise WorkflowError(f"{label} did not leave member login page.")
+
+    retry_step(label, 4, attempt_login)
 
 
 def login(page: Page, config: Config) -> None:
@@ -705,6 +926,7 @@ def login(page: Page, config: Config) -> None:
         logging.info("Login page did not reach networkidle; continuing after DOM content loaded.")
     if is_logged_in(page):
         logging.info("Already logged in; current URL: %s", page.url)
+        click_accept_all_if_present(page, timeout_ms=12_000)
         return
 
     ocr = ddddocr.DdddOcr(show_ad=False)
@@ -729,6 +951,9 @@ def login(page: Page, config: Config) -> None:
             if is_logged_in(page):
                 return
             page.wait_for_timeout(1_000)
+        if confirm_zhixian_login_by_resource_page(page):
+            logging.info("Login confirmed by zhixian English database page.")
+            return
         if not is_logged_in(page):
             captcha = page.locator('img[src*="ShowKey" i]').first
             if captcha.count():
@@ -738,11 +963,21 @@ def login(page: Page, config: Config) -> None:
 
     retry_step("login", 4, attempt_login)
     logging.info("Login succeeded; current URL: %s", page.url)
+    click_accept_all_if_present(page, timeout_ms=12_000)
 
 
 def choose_resource(page: Page) -> None:
-    click_xpath(page, ENGLISH_DATABASE_XPATH, "English database tab")
-    click_xpath(page, WOS_SCI_XPATH, "Web of Science/SCI")
+    try:
+        text = page.locator("body").inner_text(timeout=5_000)
+        if "zhixianlib.com/e/action/ListInfo" in page.url and "Web of Science【njust推荐】" in text:
+            logging.info("English database page is already open.")
+            return
+    except PlaywrightTimeoutError:
+        pass
+    try:
+        click_by_text(page, ["英文数据库", "English database"], "English database tab", timeout_ms=12_000)
+    except WorkflowError:
+        click_xpath(page, ENGLISH_DATABASE_XPATH, "English database tab")
     page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
 
 
@@ -944,74 +1179,11 @@ def expected_click_count(instruction: str) -> int:
     return 1 if match else 0
 
 
-def solve_2captcha_coordinates(
-    api_key: str,
-    image_bytes: bytes,
-    instruction: str,
-    poll_interval: int = 5,
-    timeout_s: int = 180,
-) -> list[dict[str, int]]:
-    response = requests.post(
-        "http://2captcha.com/in.php",
-        data={
-            "key": api_key,
-            "method": "post",
-            "coordinatescaptcha": 1,
-            "textinstructions": instruction,
-            "json": 1,
-        },
-        files={"file": ("captcha.png", image_bytes, "image/png")},
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("status") != 1:
-        raise WorkflowError(f"2captcha submit failed: {payload.get('request')}")
-
-    captcha_id = payload["request"]
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        time.sleep(poll_interval)
-        result = requests.get(
-            "http://2captcha.com/res.php",
-            params={"key": api_key, "action": "get", "id": captcha_id, "json": 1},
-            timeout=30,
-        )
-        result.raise_for_status()
-        data = result.json()
-        if data.get("status") == 1:
-            return parse_2captcha_coordinates(str(data.get("request", "")))
-        if data.get("request") != "CAPCHA_NOT_READY":
-            raise WorkflowError(f"2captcha solve failed: {data.get('request')}")
-
-    raise WorkflowError("2captcha timed out.")
-
-
-def parse_2captcha_coordinates(raw: str) -> list[dict[str, int]]:
-    points: list[dict[str, int]] = []
-    for x_raw, y_raw in re.findall(r"x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)", raw):
-        points.append({"x": int(x_raw), "y": int(y_raw)})
-    if points:
-        return points
-
-    try:
-        parsed = ast.literal_eval(raw)
-    except (ValueError, SyntaxError):
-        parsed = None
-
-    if isinstance(parsed, list):
-        for item in parsed:
-            if isinstance(item, dict) and "x" in item and "y" in item:
-                points.append({"x": int(item["x"]), "y": int(item["y"])})
-    if not points:
-        raise WorkflowError(f"Cannot parse 2captcha coordinates: {raw!r}")
-    return points
-
-
 def click_entry_and_get_page(
     context: BrowserContext,
     page: Page,
     entry_name: str,
+    config: Config,
     sms_text: str,
     manual_captcha: bool,
 ) -> Page:
@@ -1020,13 +1192,34 @@ def click_entry_and_get_page(
     old_pages = set(context.pages)
 
     logging.info("Trying WOS entry: %s", entry_name)
-    link.click()
+    try:
+        with context.expect_page(timeout=5_000) as page_info:
+            link.click()
+        active_page = page_info.value
+    except PlaywrightTimeoutError:
+        link.click()
+        active_page = page
     wait_after_action(page, f"WOS entry {entry_name}")
     page.wait_for_timeout(5_000)
 
     new_pages = [candidate for candidate in context.pages if candidate not in old_pages]
-    active_page = new_pages[-1] if new_pages else page
+    active_page = new_pages[-1] if new_pages else active_page
     active_page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+    for _ in range(12):
+        if is_member_login_page(active_page):
+            logging.info("WOS entry opened member login page; logging in again for %s.", entry_name)
+            login_current_page(active_page, config, f"{entry_name} member login")
+            active_page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+            break
+        try:
+            body_text = active_page.locator("body").inner_text(timeout=2_000)
+        except Exception:
+            body_text = ""
+        if is_wos_page_text(body_text) or "webofscience" in active_page.url.lower():
+            break
+        if active_page.locator(", ".join(CLICK_CAPTCHA_SELECTORS)).count():
+            break
+        active_page.wait_for_timeout(1_000)
     if solve_click_captcha_until_wos_page(active_page, entry_name, sms_text, manual_captcha):
         return active_page
     raise WorkflowError(f"Entry did not reach WOS page: {entry_name}")
@@ -1036,16 +1229,18 @@ def select_working_entry(
     context: BrowserContext,
     page: Page,
     state: dict[str, Any],
+    config: Config,
     sms_text: str,
     manual_captcha: bool,
 ) -> Page:
     last_error: Optional[Exception] = None
     for entry_name in ordered_entries(state):
         try:
-            wos_page = click_entry_and_get_page(context, page, entry_name, sms_text, manual_captcha)
+            wos_page = click_entry_and_get_page(context, page, entry_name, config, sms_text, manual_captcha)
             state["last_working_entry"] = entry_name
             save_state(state)
             logging.info("Selected WOS entry: %s", entry_name)
+            click_accept_all_if_present(wos_page, timeout_ms=12_000)
             return wos_page
         except Exception as exc:
             last_error = exc
@@ -1057,11 +1252,18 @@ def select_working_entry(
 
 def open_advanced_search(page: Page) -> None:
     dismiss_wos_overlays(page)
-    try:
-        click_xpath(page, ADVANCED_SEARCH_XPATH, "Advanced Search", timeout_ms=12_000)
-    except WorkflowError:
-        click_by_text(page, ["Advanced Search"], "Advanced Search")
-    page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+    body_text = page.locator("body").inner_text(timeout=5_000)
+    already_open = "advanced-search" in page.url or (
+        "QUERY BUILDER" in body_text and "FIELDED SEARCH" in body_text
+    )
+    if already_open:
+        logging.info("Advanced Search is already open; continuing.")
+    else:
+        try:
+            click_xpath(page, ADVANCED_SEARCH_XPATH, "Advanced Search", timeout_ms=12_000)
+        except WorkflowError:
+            click_by_text(page, ["Advanced Search"], "Advanced Search")
+        page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
     dismiss_wos_overlays(page)
     page.wait_for_selector("text=/Advanced search|FIELDED SEARCH|QUERY BUILDER/i", timeout=DEFAULT_TIMEOUT_MS)
     clicked = page.evaluate(
@@ -1113,11 +1315,60 @@ def open_advanced_search(page: Page) -> None:
     save_debug_artifacts(page, "after_open_advanced_search")
 
 
-def fill_publication_date_query(page: Page, date_value: str) -> None:
-    field_selector = page.get_by_role("combobox", name=re.compile("Select search field", re.I)).first
-    field_selector.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-    field_selector.click()
+def solve_blocking_recaptcha_if_present(page: Page, sms_text: str, label: str) -> None:
+    for attempt in range(1, 4):
+        if not solve_recaptcha_if_present(page, [], f"{label}_{attempt}", sms_text):
+            return
+        page.wait_for_timeout(3_000)
+        if not recaptcha_present(page, []):
+            return
+    if recaptcha_present(page, []):
+        save_debug_artifacts(page, f"{label}_still_blocked_after_bingtop")
+        raise WorkflowError(f"Captcha is still blocking the page after Bingtop attempts: {label}")
+
+
+def click_search_field_dropdown(page: Page) -> None:
+    candidates = [
+        page.get_by_role("combobox", name=re.compile("Select search field", re.I)).first,
+        page.get_by_role("combobox", name=re.compile("All Fields", re.I)).first,
+        page.get_by_role("combobox").first,
+    ]
+    for locator in candidates:
+        try:
+            locator.wait_for(state="visible", timeout=5_000)
+            locator.click(timeout=5_000, force=True)
+            wait_after_action(page, "search field dropdown")
+            return
+        except Exception:
+            continue
+
+    clicked = page.evaluate(
+        """() => {
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const candidates = [...document.querySelectorAll(
+                '[role="combobox"], mat-select, button, .mat-mdc-select, .mat-select'
+            )].filter(visible);
+            const target = candidates.find((el) => /All Fields|Select search field/i.test(normalize(
+                el.innerText || el.textContent || el.getAttribute('aria-label')
+            ))) || candidates[0];
+            if (!target) return false;
+            target.click();
+            return true;
+        }"""
+    )
+    if not clicked:
+        save_debug_artifacts(page, "search_field_dropdown_not_found")
+        raise WorkflowError("Search field dropdown was not found.")
     wait_after_action(page, "search field dropdown")
+
+
+def fill_publication_date_query(page: Page, date_value: str) -> None:
+    logging.info("Selecting Publication Date search field.")
+    click_search_field_dropdown(page)
 
     option = page.get_by_role("option", name=re.compile(r"^Publication Date$", re.I))
     for _ in range(20):
@@ -1136,8 +1387,9 @@ def fill_publication_date_query(page: Page, date_value: str) -> None:
         save_debug_artifacts(page, "publication_date_option_not_found")
         raise WorkflowError("Publication Date option was not found in All Fields dropdown.")
 
-    page.wait_for_selector("text=Publication Date", timeout=DEFAULT_TIMEOUT_MS)
+    page.wait_for_selector("text=Publication Date", timeout=10_000)
     wait_after_action(page, "Publication Date field ready")
+    logging.info("Filling Publication Date query for %s.", date_value)
     filled = page.evaluate(
         """(dateValue) => {
             const visible = (el) => {
@@ -1188,15 +1440,53 @@ def fill_publication_date_query(page: Page, date_value: str) -> None:
 
 def query_preview_value(page: Page) -> str:
     try:
-        return page.locator('textarea[placeholder*="Enter or edit"], textarea').first.input_value(timeout=3_000)
+        value = page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const textareas = [...document.querySelectorAll('textarea')].filter(visible);
+                const values = textareas
+                    .map((el) => el.value || el.textContent || '')
+                    .map((value) => value.trim())
+                    .filter(Boolean);
+                return values.find((value) => /DOP=/.test(value)) || values[0] || '';
+            }"""
+        )
+        return str(value)
     except Exception:
         return ""
+
+
+def page_contains_query(page: Page, expected: str) -> bool:
+    try:
+        return expected in page.locator("body").inner_text(timeout=5_000)
+    except Exception:
+        return False
+
+
+def is_search_results_for_date(page: Page, date_value: str) -> bool:
+    expected = f"DOP=({date_value}/{date_value})"
+    try:
+        if expected in page.title(timeout=3_000):
+            return True
+    except Exception:
+        pass
+    try:
+        body_text = page.locator("body").inner_text(timeout=5_000)
+    except Exception:
+        return False
+    return expected in body_text and re.search(r"results from Web of Science Core Collection|Search results", body_text, re.I) is not None
 
 
 def ensure_date_query(page: Page, date_value: str) -> None:
     preview_value = query_preview_value(page)
     expected = f"DOP=({date_value}/{date_value})"
-    if expected in preview_value:
+    if is_search_results_for_date(page, date_value):
+        logging.info("Already on search results page for %s.", expected)
+        return
+    if expected in preview_value or page_contains_query(page, expected):
         return
 
     logging.info("Query preview missing %s; rebuilding date query.", expected)
@@ -1225,7 +1515,7 @@ def click_search_button(page: Page) -> None:
     wait_after_action(page, "Search button")
 
 
-def wait_for_search_results_with_captcha(page: Page, label: str, date_value: str) -> None:
+def wait_for_search_results_with_captcha(page: Page, label: str, date_value: str, sms_text: str) -> None:
     observed_urls: list[str] = []
 
     def record_captcha_request(request) -> None:
@@ -1237,19 +1527,32 @@ def wait_for_search_results_with_captcha(page: Page, label: str, date_value: str
     try:
         for attempt in range(1, 4):
             try:
+                if is_search_results_for_date(page, date_value):
+                    return
                 ensure_date_query(page, date_value)
+                if is_search_results_for_date(page, date_value):
+                    return
                 click_search_button(page)
                 page.wait_for_load_state("domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
                 page.wait_for_selector("text=/results from Web of Science Core Collection/i", timeout=90_000)
                 return
             except PlaywrightTimeoutError as exc:
                 save_debug_artifacts(page, f"{label}_search_wait_timeout_{attempt}", exc)
+                if is_search_results_for_date(page, date_value):
+                    logging.info("Search results page loaded for %s after timeout fallback.", date_value)
+                    return
                 body_text = page.locator("body").inner_text(timeout=10_000)
                 verification_error = "request couldn't be verified" in body_text.lower()
+                if is_search_results_for_date(page, date_value):
+                    logging.info("Search results page confirmed for %s from body text.", date_value)
+                    return
                 if not (verification_error or recaptcha_present(page, observed_urls)):
                     raise
-                if not solve_recaptcha_if_present(page, observed_urls, f"{label}_search_attempt_{attempt}"):
+                if not solve_recaptcha_if_present(page, observed_urls, f"{label}_search_attempt_{attempt}", sms_text):
                     raise
+                if is_search_results_for_date(page, date_value):
+                    logging.info("Search results page loaded for %s after captcha solve.", date_value)
+                    return
                 page.wait_for_timeout(RETRY_DELAY_S * 1_000)
         raise WorkflowError(f"Search did not show results after captcha handling: {label}")
     finally:
@@ -1259,10 +1562,10 @@ def wait_for_search_results_with_captcha(page: Page, label: str, date_value: str
             pass
 
 
-def run_search_and_count(page: Page, date_value: str) -> int:
+def run_search_and_count(page: Page, date_value: str, sms_text: str) -> int:
     dismiss_wos_overlays(page)
     save_debug_artifacts(page, "before_search_click")
-    wait_for_search_results_with_captcha(page, "date_query", date_value)
+    wait_for_search_results_with_captcha(page, "date_query", date_value, sms_text)
     body_text = page.locator("body").inner_text(timeout=DEFAULT_TIMEOUT_MS)
     count = extract_result_count(body_text)
     logging.info("Search result count: %d", count)
@@ -1282,10 +1585,12 @@ def extract_result_count(text: str) -> int:
     raise WorkflowError("Cannot determine result count from page text.")
 
 
-def search_date_and_count(page: Page, date_value: str) -> int:
+def search_date_and_count(page: Page, date_value: str, sms_text: str) -> int:
     open_advanced_search(page)
+    solve_blocking_recaptcha_if_present(page, sms_text, "advanced_search_gate")
+    dismiss_wos_overlays(page)
     fill_publication_date_query(page, date_value)
-    return run_search_and_count(page, date_value)
+    return run_search_and_count(page, date_value, sms_text)
 
 
 def is_recaptcha_url(url: str) -> bool:
@@ -1298,22 +1603,6 @@ def is_recaptcha_url(url: str) -> bool:
 
 def is_hcaptcha_url(url: str) -> bool:
     return "api.hcaptcha.com/getcaptcha" in url.lower() or "hcaptcha.com" in url.lower()
-
-
-def extract_recaptcha_sitekey_from_url(url: str) -> Optional[str]:
-    try:
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-    except Exception:
-        return None
-    values = query.get("k") or query.get("sitekey")
-    if values:
-        return values[0]
-
-    match = re.search(r"/getcaptcha/([^/?#]+)", parsed.path)
-    if match:
-        return match.group(1)
-    return None
 
 
 def recaptcha_present(page: Page, observed_urls: list[str]) -> bool:
@@ -1331,50 +1620,6 @@ def recaptcha_present(page: Page, observed_urls: list[str]) -> bool:
         return False
 
 
-def find_recaptcha_sitekey(page: Page, observed_urls: list[str]) -> Optional[str]:
-    for url in reversed(observed_urls):
-        sitekey = extract_recaptcha_sitekey_from_url(url)
-        if sitekey:
-            return sitekey
-
-    sitekey = page.evaluate(
-        """() => {
-            const direct = document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey');
-            if (direct) return direct;
-            for (const iframe of document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="hcaptcha"]')) {
-                try {
-                    const parsed = new URL(iframe.src);
-                    const key = parsed.searchParams.get('k') || parsed.searchParams.get('sitekey');
-                    if (key) return key;
-                } catch (_) {}
-            }
-            return null;
-        }"""
-    )
-    return str(sitekey).strip() if sitekey else None
-
-
-def extract_hcaptcha_rqdata_from_url(url: str) -> Optional[str]:
-    try:
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-    except Exception:
-        return None
-
-    values = query.get("rqdata") or query.get("data")
-    if values and values[0]:
-        return values[0]
-    return None
-
-
-def find_hcaptcha_rqdata(observed_urls: list[str]) -> Optional[str]:
-    for url in reversed(observed_urls):
-        rqdata = extract_hcaptcha_rqdata_from_url(url)
-        if rqdata:
-            return rqdata
-    return None
-
-
 def save_recaptcha_observations(observed_urls: list[str], label: str) -> None:
     if not observed_urls:
         return
@@ -1385,65 +1630,117 @@ def save_recaptcha_observations(observed_urls: list[str], label: str) -> None:
     path.write_text("\n".join(unique_urls), encoding="utf-8")
 
 
-def inject_recaptcha_token(page: Page, token: str) -> dict[str, int]:
-    result = page.evaluate(
-        """(token) => {
-            const textareas = [...document.querySelectorAll(
-                [
-                    'textarea[name="g-recaptcha-response"]',
-                    'textarea#g-recaptcha-response',
-                    'textarea[name="h-captcha-response"]',
-                    'textarea#h-captcha-response',
-                ].join(',')
-            )];
-            if (!textareas.length) {
-                for (const name of ['g-recaptcha-response', 'h-captcha-response']) {
-                    const textarea = document.createElement('textarea');
-                    textarea.name = name;
-                    textarea.id = name;
-                    textarea.style.display = 'none';
-                    document.body.appendChild(textarea);
-                    textareas.push(textarea);
-                }
-            }
-            for (const textarea of textareas) {
-                textarea.value = token;
-                textarea.innerHTML = token;
-                textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                textarea.dispatchEvent(new Event('change', { bubbles: true }));
-            }
+def visible_visual_captcha_locator(page: Page) -> Optional[Locator]:
+    selectors = [
+        'iframe[src*="hcaptcha.com"][title*="challenge" i]',
+        'iframe[src*="newassets.hcaptcha.com"][title*="challenge" i]',
+        'iframe[src*="recaptcha"][title*="challenge" i]',
+        'iframe[src*="recaptcha/api2/bframe"]',
+        'iframe[src*="hcaptcha.com"]',
+        'iframe[src*="recaptcha"]',
+    ]
+    for selector in selectors:
+        locators = page.locator(selector)
+        try:
+            count = locators.count()
+        except Exception:
+            continue
+        for index in range(count):
+            locator = locators.nth(index)
+            try:
+                if not locator.is_visible(timeout=1_000):
+                    continue
+                box = locator.bounding_box()
+                if box and box["width"] >= 250 and box["height"] >= 180:
+                    return locator
+            except Exception:
+                continue
 
-            const callbacks = [];
-            const seen = new Set();
-            const visit = (value, depth = 0) => {
-                if (!value || depth > 6 || seen.has(value)) return;
-                if (typeof value === 'object' || typeof value === 'function') seen.add(value);
-                if (typeof value === 'function') return;
-                if (typeof value !== 'object') return;
-                for (const key of Object.keys(value)) {
-                    const child = value[key];
-                    if (key === 'callback' && typeof child === 'function') {
-                        callbacks.push(child);
-                    } else {
-                        visit(child, depth + 1);
-                    }
-                }
-            };
-            visit(window.___grecaptcha_cfg?.clients || {});
-            for (const callback of callbacks) {
-                try { callback(token); } catch (_) {}
-            }
-            return { textareas: textareas.length, callbacks: callbacks.length };
-        }""",
-        token,
+    body = page.locator("body").first
+    try:
+        if body.is_visible(timeout=1_000):
+            return body
+    except Exception:
+        return None
+    return None
+
+
+def click_captcha_verify_if_present(page: Page) -> bool:
+    verify_text = re.compile(r"^(Verify|Submit|Done|验证|提交|完成|确定)$", re.I)
+    for frame in page.frames:
+        frame_url = frame.url.lower()
+        if "hcaptcha" not in frame_url and "recaptcha" not in frame_url:
+            continue
+        locators = [
+            frame.get_by_role("button", name=verify_text).first,
+            frame.get_by_text(verify_text).first,
+            frame.locator("button:has-text('Verify'), button:has-text('验证'), button:has-text('Submit')").first,
+        ]
+        for locator in locators:
+            try:
+                if locator.count() and locator.is_visible(timeout=1_000):
+                    locator.click(timeout=5_000, force=True)
+                    wait_after_action(page, "captcha verify button")
+                    logging.info("Clicked captcha verify button.")
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def solve_visual_captcha_with_bingtop(page: Page, sms_text: str, label: str) -> bool:
+    credentials = extract_bingtop_credentials(sms_text)
+    if credentials is None:
+        raise WorkflowError("Captcha detected, but Bingtop username/password were not found in sms.md.")
+
+    captcha = visible_visual_captcha_locator(page)
+    if captcha is None:
+        save_debug_artifacts(page, f"{label}_bingtop_visual_captcha_missing")
+        raise WorkflowError("Captcha detected, but no visible visual challenge could be screenshotted.")
+
+    image_bytes = captcha.screenshot(timeout=10_000)
+    DEBUG_DIR.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    (DEBUG_DIR / f"{stamp}_{safe_name(label)}_bingtop_input.png").write_bytes(image_bytes)
+
+    try:
+        points = solve_click_coordinates(credentials, image_bytes, BINGTOP_RECAPTCHA_CAPTCHA_TYPE)
+    except BingtopCaptchaError as exc:
+        save_debug_artifacts(page, f"{label}_bingtop_solve_failed", exc)
+        raise WorkflowError(f"Bingtop captcha solve failed: {exc}") from exc
+
+    box = captcha.bounding_box()
+    if not box:
+        raise WorkflowError("Cannot locate visual captcha bounding box.")
+
+    image_width, image_height = png_dimensions(image_bytes)
+    scale_x = box["width"] / image_width
+    scale_y = box["height"] / image_height
+    logging.info(
+        "Bingtop visual captcha geometry for %s: screenshot=%dx%d css=%.1fx%.1f scale=%.3f,%.3f.",
+        label,
+        image_width,
+        image_height,
+        box["width"],
+        box["height"],
+        scale_x,
+        scale_y,
     )
-    return {
-        "textareas": int(result.get("textareas", 0)),
-        "callbacks": int(result.get("callbacks", 0)),
-    }
+    for point in points:
+        page.mouse.click(box["x"] + point.x * scale_x, box["y"] + point.y * scale_y)
+        wait_after_action(page, "Bingtop visual captcha point")
+
+    click_captcha_verify_if_present(page)
+    logging.info(
+        "Clicked %d Bingtop visual captcha coordinates for %s type %s.",
+        len(points),
+        label,
+        BINGTOP_RECAPTCHA_CAPTCHA_TYPE,
+    )
+    return True
 
 
-def solve_recaptcha_if_present(page: Page, observed_urls: list[str], label: str) -> bool:
+def solve_recaptcha_if_present(page: Page, observed_urls: list[str], label: str, sms_text: str) -> bool:
     if not recaptcha_present(page, observed_urls):
         return False
 
@@ -1456,44 +1753,14 @@ def solve_recaptcha_if_present(page: Page, observed_urls: list[str], label: str)
             ).count() > 0
         except Exception:
             is_hcaptcha = False
-    sitekey = find_recaptcha_sitekey(page, observed_urls)
-    if not sitekey:
-        save_debug_artifacts(page, f"{label}_recaptcha_sitekey_missing")
-        raise WorkflowError("Captcha detected, but sitekey was not found.")
-
     captcha_name = "hCaptcha" if is_hcaptcha else "reCAPTCHA v2"
-    logging.info("%s detected for %s; solving with 2captcha.", captcha_name, label)
-    try:
-        user_agent = page.evaluate("() => navigator.userAgent")
-        if is_hcaptcha:
-            solution = solve_hcaptcha(
-                website_url=page.url,
-                website_key=sitekey,
-                user_agent=user_agent,
-                rqdata=find_hcaptcha_rqdata(observed_urls),
-                timeout_s=RECAPTCHA_SOLVE_TIMEOUT_S,
-            )
-        else:
-            solution = solve_recaptcha_v2(
-                website_url=page.url,
-                website_key=sitekey,
-                user_agent=user_agent,
-                timeout_s=RECAPTCHA_SOLVE_TIMEOUT_S,
-            )
-    except TwoCaptchaRecaptchaError as exc:
-        save_debug_artifacts(page, f"{label}_recaptcha_solve_failed", exc)
-        raise WorkflowError(f"2captcha captcha solve failed: {exc}") from exc
-
-    injected = inject_recaptcha_token(page, solution.token)
     logging.info(
-        "Injected %s token for %s into %d textarea(s), called %d callback(s).",
+        "%s detected for %s; solving with Bingtop screenshot captcha type %s.",
         captcha_name,
         label,
-        injected["textareas"],
-        injected["callbacks"],
+        BINGTOP_RECAPTCHA_CAPTCHA_TYPE,
     )
-    wait_after_action(page, f"{captcha_name} token injection")
-    return True
+    return solve_visual_captcha_with_bingtop(page, sms_text, label)
 
 
 def click_export_button_for_download(page: Page) -> None:
@@ -1528,7 +1795,30 @@ def close_export_dialog_if_open(page: Page) -> None:
         pass
 
 
-def wait_for_export_download_with_recaptcha(page: Page, label: str) -> Download:
+def export_too_large_prompt_present(page: Page) -> bool:
+    try:
+        body_text = page.locator("body").inner_text(timeout=3_000)
+    except Exception:
+        return False
+    normalized = " ".join(body_text.split()).lower()
+    return (
+        "this export took longer than expected" in normalized
+        and "please select fewer records" in normalized
+    )
+
+
+def raise_if_export_too_large_prompt(page: Page, label: str) -> None:
+    if not export_too_large_prompt_present(page):
+        return
+    save_debug_artifacts(page, f"{label}_export_too_large_prompt")
+    click_try_again_if_present(page, timeout_ms=1_000)
+    close_export_dialog_if_open(page)
+    raise ExportBatchSkipped(
+        "Export took longer than expected; skipping this batch and continuing."
+    )
+
+
+def wait_for_export_download_with_recaptcha(page: Page, label: str, sms_text: str) -> Download:
     observed_urls: list[str] = []
 
     def record_recaptcha_request(request) -> None:
@@ -1545,8 +1835,9 @@ def wait_for_export_download_with_recaptcha(page: Page, label: str) -> Download:
                 return download_info.value
             except PlaywrightTimeoutError as exc:
                 save_debug_artifacts(page, f"{label}_download_wait_timeout_{attempt}", exc)
+                raise_if_export_too_large_prompt(page, label)
                 click_try_again_if_present(page)
-                if not solve_recaptcha_if_present(page, observed_urls, f"{label}_attempt_{attempt}"):
+                if not solve_recaptcha_if_present(page, observed_urls, f"{label}_attempt_{attempt}", sms_text):
                     raise
                 try:
                     with page.expect_download(timeout=180_000) as download_info:
@@ -1555,6 +1846,7 @@ def wait_for_export_download_with_recaptcha(page: Page, label: str) -> Download:
                     return download_info.value
                 except PlaywrightTimeoutError as second_exc:
                     save_debug_artifacts(page, f"{label}_after_recaptcha_timeout_{attempt}", second_exc)
+                    raise_if_export_too_large_prompt(page, label)
                     click_try_again_if_present(page)
                     if attempt >= 3:
                         raise
@@ -1568,13 +1860,89 @@ def wait_for_export_download_with_recaptcha(page: Page, label: str) -> Download:
             pass
 
 
-def export_batch(page: Page, date_value: str, start: int, end: int, download_dir: Path) -> Download:
+def click_export_menu(page: Page) -> None:
+    try:
+        page.get_by_role("button", name=re.compile(r"^Export$", re.I)).last.click(timeout=8_000)
+        wait_after_action(page, "Export menu")
+        return
+    except Exception as exc:
+        save_debug_artifacts(page, "export_menu_role_click_failed", exc)
+
+    clicked = page.evaluate(
+        """() => {
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const candidates = [...document.querySelectorAll('button, [role="button"], a')]
+              .filter(visible)
+              .filter((el) => /^Export$/i.test(normalize(el.innerText || el.textContent || el.getAttribute('aria-label'))));
+            const target = candidates[candidates.length - 1];
+            if (!target) return false;
+            target.click();
+            return true;
+        }"""
+    )
+    if not clicked:
+        save_debug_artifacts(page, "export_menu_not_found")
+        raise WorkflowError("Export menu button was not found.")
+    wait_after_action(page, "Export menu fallback")
+
+
+def click_bibtex_menu_item(page: Page) -> None:
+    try:
+        page.get_by_role("menuitem", name=re.compile(r"^BibTeX$", re.I)).click(timeout=8_000)
+        wait_after_action(page, "BibTeX menu item")
+        return
+    except Exception as exc:
+        save_debug_artifacts(page, "bibtex_menuitem_role_click_failed", exc)
+
+    for locator in [
+        page.get_by_text(re.compile(r"^BibTeX$", re.I)).first,
+        page.locator("button, a, [role='menuitem'], [role='option']").filter(has_text=re.compile(r"^BibTeX$", re.I)).first,
+    ]:
+        try:
+            locator.click(timeout=5_000, force=True)
+            wait_after_action(page, "BibTeX menu item fallback")
+            return
+        except Exception:
+            continue
+
+    clicked = page.evaluate(
+        """() => {
+            const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const target = [...document.querySelectorAll('button, a, [role="menuitem"], [role="option"], span')]
+              .filter(visible)
+              .find((el) => /^BibTeX$/i.test(normalize(el.innerText || el.textContent)));
+            const clickable = target?.closest?.('button, a, [role="menuitem"], [role="option"]') || target;
+            if (!clickable) return false;
+            clickable.click();
+            return true;
+        }"""
+    )
+    if not clicked:
+        save_debug_artifacts(page, "bibtex_menuitem_not_found")
+        raise WorkflowError("BibTeX export menu item was not found.")
+    wait_after_action(page, "BibTeX menu item DOM fallback")
+
+
+def export_batch(
+    page: Page,
+    date_value: str,
+    start: int,
+    end: int,
+    download_dir: Path,
+    sms_text: str,
+) -> Download:
     logging.info("Exporting %s records %d to %d", date_value, start, end)
     close_export_dialog_if_open(page)
-    page.get_by_role("button", name=re.compile(r"^Export$", re.I)).last.click()
-    wait_after_action(page, "Export menu")
-    page.get_by_role("menuitem", name=re.compile(r"^BibTeX$", re.I)).click()
-    wait_after_action(page, "BibTeX menu item")
+    click_export_menu(page)
+    click_bibtex_menu_item(page)
     page.wait_for_selector("text=Export Records to BibTeX File", timeout=DEFAULT_TIMEOUT_MS)
 
     range_radio = page.locator('input[type="radio"][value="fromRange"]').first
@@ -1595,7 +1963,7 @@ def export_batch(page: Page, date_value: str, start: int, end: int, download_dir
     wait_after_action(page, "record content option")
 
     download_dir.mkdir(exist_ok=True)
-    download = wait_for_export_download_with_recaptcha(page, f"export_{start}_{end}")
+    download = wait_for_export_download_with_recaptcha(page, f"export_{start}_{end}", sms_text)
     suggested_name = download.suggested_filename or f"wos_{start}_{end}.bib"
     download_name = f"wos_{safe_name(date_value)}_{start}_{end}_{int(time.time())}_{suggested_name}"
     download.save_as(download_dir / download_name)
@@ -1607,10 +1975,12 @@ def process_task(
     page: Page,
     task: DateTask,
     tasks: list[DateTask],
+    sms_text: str,
+    account_log_account: Optional[str] = None,
     max_batches: Optional[int] = None,
 ) -> int:
     logging.info("Processing date %s from progress %s", task.date, task.progress)
-    total = retry_step(f"search date {task.date}", 3, lambda: search_date_and_count(page, task.date))
+    total = retry_step(f"search date {task.date}", 3, lambda: search_date_and_count(page, task.date, sms_text))
     task.total = total
     task.status = "downloading"
     write_date_tasks(tasks)
@@ -1630,8 +2000,31 @@ def process_task(
             retry_step(
                 f"export records {start}-{end}",
                 3,
-                lambda start=start, end=end: export_batch(page, task.date, start, end, DOWNLOAD_DIR),
+                lambda start=start, end=end: export_batch(page, task.date, start, end, DOWNLOAD_DIR, sms_text),
             )
+        except ExportBatchSkipped as exc:
+            logging.warning("Skipped export batch %s records %d-%d: %s", task.date, start, end, exc)
+            task.downloaded = end
+            task.total = total
+            task.status = "done" if end >= total else "downloading"
+            write_date_tasks(tasks)
+            if account_log_account:
+                try:
+                    update_account_daily_log(
+                        account=account_log_account,
+                        result="running",
+                        batches=0,
+                        records=0,
+                        message=f"Skipped {task.date} records {start}-{end}: export took too long.",
+                        count_run=False,
+                    )
+                except Exception:
+                    logging.exception("Failed to update account daily skip log for %s.", account_log_account)
+            if max_batches is not None and batches_done >= max_batches:
+                logging.info("Stopped after %d batch(es) by --max-batches.", batches_done)
+                break
+            start = end + 1
+            continue
         except Exception as exc:
             save_debug_artifacts(page, f"export_failed_{task.date}_{start}_{end}", exc)
             task.status = "failed"
@@ -1645,6 +2038,18 @@ def process_task(
         task.status = "done" if end >= total else "downloading"
         write_date_tasks(tasks)
         batches_done += 1
+        if account_log_account:
+            try:
+                update_account_daily_log(
+                    account=account_log_account,
+                    result="running",
+                    batches=1,
+                    records=end - start + 1,
+                    message=f"Downloaded {task.date} records {start}-{end}.",
+                    count_run=False,
+                )
+            except Exception:
+                logging.exception("Failed to update account daily batch log for %s.", account_log_account)
         if max_batches is not None and batches_done >= max_batches:
             logging.info("Stopped after %d batch(es) by --max-batches.", batches_done)
             break
@@ -1657,6 +2062,8 @@ def process_task(
 def process_available_tasks(
     page: Page,
     tasks: list[DateTask],
+    sms_text: str,
+    account_log_account: Optional[str] = None,
     max_batches: Optional[int] = None,
 ) -> int:
     total_batches_done = 0
@@ -1676,6 +2083,8 @@ def process_available_tasks(
             page,
             task,
             tasks,
+            sms_text,
+            account_log_account=account_log_account,
             max_batches=remaining_batches,
         )
 
@@ -1694,76 +2103,125 @@ def run(args: argparse.Namespace) -> int:
     state = load_state()
     with sync_playwright() as playwright:
         total_batches_done = 0
-        for account_index, config in enumerate(configs, start=1):
-            if next_task(tasks) is None:
-                return 0
-            if args.max_batches is not None and total_batches_done >= args.max_batches:
-                return 0
-
-            session: Optional[BrowserSession] = None
-            try:
-                session = open_browser_session(playwright, args)
-                context = session.context
-                page = session.page
-                logging.info(
-                    "Using account %d/%d: %s",
-                    account_index,
-                    len(configs),
-                    config.label or config.username,
-                )
-                login(page, config)
-                choose_resource(page)
-                wos_page = select_working_entry(context, page, state, sms_text, args.manual_captcha)
-                remaining_batches = None
-                if args.max_batches is not None:
-                    remaining_batches = args.max_batches - total_batches_done
-                total_batches_done += process_available_tasks(
-                    wos_page,
-                    tasks,
-                    max_batches=remaining_batches,
-                )
-                if args.max_batches is not None and total_batches_done >= args.max_batches:
-                    return 0
+        while True:
+            for account_index, config in enumerate(configs, start=1):
                 if next_task(tasks) is None:
                     return 0
-            except AccountDownloadLimit as exc:
-                for index, open_page in enumerate(context.pages):
-                    try:
-                        save_debug_artifacts(open_page, f"account_limit_page_{index}", exc)
-                    except Exception:
-                        logging.exception("Failed to collect debug artifacts for page %d.", index)
-                logging.warning(
-                    "Account %s appears to have reached today's download limit; switching account.",
-                    config.label or config.username,
-                )
-                continue
-            except Exception as exc:
-                task = next_task(tasks)
-                if task is not None:
-                    task.status = "failed"
-                    write_date_tasks(tasks)
-                if session is not None:
-                    for index, open_page in enumerate(session.context.pages):
-                        try:
-                            save_debug_artifacts(open_page, f"workflow_failed_page_{index}", exc)
-                        except Exception:
-                            logging.exception("Failed to collect debug artifacts for page %d.", index)
-                progress = task.progress if task is not None else "n/a"
-                logging.exception("Workflow failed. Progress preserved as %s.", progress)
-                return 1
-            finally:
-                if session is not None:
-                    close_browser_session(session, args)
+                if args.max_batches is not None and total_batches_done >= args.max_batches:
+                    return 0
 
-        task = next_task(tasks)
-        if task is None:
-            return 0
-        logging.error(
-            "No more configured accounts. Remaining task %s is preserved as %s.",
-            task.date,
-            task.progress,
-        )
-        return 1
+                session: Optional[BrowserSession] = None
+                account = config.label or config.username
+                account_result = "unknown"
+                account_message = ""
+                try:
+                    session = open_browser_session(playwright, args)
+                    context = session.context
+                    page = session.page
+                    logging.info(
+                        "Using account %d/%d: %s",
+                        account_index,
+                        len(configs),
+                        account,
+                    )
+                    login(page, config)
+                    choose_resource(page)
+                    wos_page = select_working_entry(context, page, state, config, sms_text, args.manual_captcha)
+                    remaining_batches = None
+                    if args.max_batches is not None:
+                        remaining_batches = args.max_batches - total_batches_done
+                    total_batches_done += process_available_tasks(
+                        wos_page,
+                        tasks,
+                        sms_text,
+                        account_log_account=account,
+                        max_batches=remaining_batches,
+                    )
+                    if args.max_batches is not None and total_batches_done >= args.max_batches:
+                        account_result = "max_batches_reached"
+                        account_message = f"Stopped after reaching --max-batches; progress {next_task(tasks).progress if next_task(tasks) else 'done'}."
+                        return 0
+                    if next_task(tasks) is None:
+                        account_result = "completed"
+                        account_message = "All date tasks are done."
+                        return 0
+                except (AccountDownloadLimit, AccountUnavailable) as exc:
+                    account_result = "account_limit"
+                    account_message = str(exc)
+                    if session is not None:
+                        for index, open_page in enumerate(session.context.pages):
+                            try:
+                                save_debug_artifacts(open_page, f"account_limit_page_{index}", exc)
+                            except Exception:
+                                logging.exception("Failed to collect debug artifacts for page %d.", index)
+                    logging.warning(
+                        "Account %s cannot continue now (%s); switching account.",
+                        account,
+                        exc,
+                    )
+                    continue
+                except Exception as exc:
+                    if str(exc).startswith("login failed after"):
+                        account_result = "login_failed"
+                        account_message = str(exc)
+                        logging.warning(
+                            "Account %s login failed after retries; switching account.",
+                            account,
+                        )
+                        continue
+                    if "connect_over_cdp" in "".join(traceback.format_exception_only(type(exc), exc)) or (
+                        "Timeout 30000ms exceeded" in str(exc) and session is None
+                    ):
+                        account_result = "account_unavailable"
+                        account_message = f"Browser CDP connection failed: {exc}"
+                        logging.warning(
+                            "Account %s browser startup failed; switching account.",
+                            account,
+                        )
+                        continue
+                    account_result = "workflow_error"
+                    account_message = str(exc)
+                    task = next_task(tasks)
+                    if task is not None:
+                        task.status = "failed"
+                        write_date_tasks(tasks)
+                    if session is not None:
+                        for index, open_page in enumerate(session.context.pages):
+                            try:
+                                save_debug_artifacts(open_page, f"workflow_failed_page_{index}", exc)
+                            except Exception:
+                                logging.exception("Failed to collect debug artifacts for page %d.", index)
+                    progress = task.progress if task is not None else "n/a"
+                    logging.exception("Workflow failed. Progress preserved as %s.", progress)
+                    return 1
+                finally:
+                    try:
+                        update_account_daily_log(
+                            account=account,
+                            result=account_result,
+                            batches=0,
+                            records=0,
+                            message=account_message,
+                        )
+                    except Exception:
+                        logging.exception("Failed to update account daily log for %s.", account)
+                    if session is not None:
+                        close_browser_session(session, args)
+
+            task = next_task(tasks)
+            if task is None:
+                return 0
+            logging.warning(
+                "No configured account can continue now. Remaining task %s is preserved as %s. "
+                "Reloading accounts and continuing with the next account cycle.",
+                task.date,
+                task.progress,
+            )
+            configs = load_configs()
+            sms_text = read_sms_text()
+            tasks = read_date_tasks()
+            state = load_state()
+            total_batches_done = 0
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1773,7 +2231,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--manual-captcha",
         action="store_true",
-        help="Pause for manual click-captcha solving instead of calling 2captcha.",
+        help="Pause for manual click-captcha solving instead of calling the configured solver.",
     )
     parser.add_argument(
         "--max-batches",
